@@ -1,31 +1,72 @@
-import os, time
+import os, time, asyncio
 from datetime import datetime, timezone
 from fastapi import FastAPI, Request, HTTPException
 import httpx
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")          # tu chat o canal (con @)
-SECRET_PATH = os.getenv("SECRET_PATH")  # ruta secreta del webhook, ej: "tg-<token recortado>"
-CRON_KEY = os.getenv("CRON_KEY")        # clave para proteger el endpoint /send
-API_URL = "https://criptoya.com/api/USDT/BOB/1"
+CHAT_ID = os.getenv("CHAT_ID")
+SECRET_PATH = os.getenv("SECRET_PATH")
+CRON_KEY = os.getenv("CRON_KEY")
 
 if not (BOT_TOKEN and SECRET_PATH and CRON_KEY):
     raise RuntimeError("Faltan variables de entorno obligatorias")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+# --- CONFIG ---
+VOLUME = 500  # monto de referencia para cotización (ajústalo si quieres)
+EXCHANGES = [
+    "binancep2p", "bybitp2p", "bitgetp2p", "paxfulp2p",
+    "eldoradop2p", "coinexp2p", "xapo"
+]
+
 app = FastAPI()
 
-async def fetch_price():
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(API_URL)
-        r.raise_for_status()
-        data = r.json()
-    ask = float(data.get("ask", 0))
-    bid = float(data.get("bid", 0))
-    t = data.get("time", 0)
-    ts = datetime.fromtimestamp(t/1000 if t > 1_000_000_000_000 else t, tz=timezone.utc)
-    return ask, bid, ts
+async def fetch_exchange_price(client: httpx.AsyncClient, ex: str):
+    url = f"https://criptoya.com/api/{ex}/USDT/BOB/{VOLUME}"
+    try:
+        r = await client.get(url, timeout=10)
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        ask = float(d.get("ask", 0) or 0)
+        bid = float(d.get("bid", 0) or 0)
+        t = d.get("time", 0)
+        ts = datetime.fromtimestamp(t/1000 if t > 1_000_000_000_000 else t, tz=timezone.utc)
+        # descarta entradas vacías
+        if ask <= 0 and bid <= 0:
+            return None
+        return {"ex": ex, "ask": ask, "bid": bid, "ts": ts}
+    except Exception:
+        return None
+
+async def fetch_top2():
+    async with httpx.AsyncClient() as client:
+        results = await asyncio.gather(
+            *[fetch_exchange_price(client, ex) for ex in EXCHANGES]
+        )
+    data = [x for x in results if x]
+
+    if not data:
+        raise RuntimeError("Sin cotizaciones disponibles en exchanges.")
+
+    # Top 2 para comprar (menor ask)
+    best_buy = sorted(
+        [d for d in data if d["ask"] > 0],
+        key=lambda x: x["ask"]
+    )[:2]
+
+    # Top 2 para vender (mayor bid)
+    best_sell = sorted(
+        [d for d in data if d["bid"] > 0],
+        key=lambda x: x["bid"],
+        reverse=True
+    )[:2]
+
+    # Marca de tiempo más reciente entre los resultados
+    ts = max(d["ts"] for d in data if "ts" in d)
+
+    return best_buy, best_sell, ts
 
 async def send_msg(text: str, chat_id: str = None):
     chat_id = chat_id or CHAT_ID
@@ -34,38 +75,63 @@ async def send_msg(text: str, chat_id: str = None):
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(f"{TG_API}/sendMessage", json={"chat_id": chat_id, "text": text})
 
+def format_top2(best_buy, best_sell, ts_local_str):
+    def line(i, row, mode):
+        # mode: "BUY" (ask) o "SELL" (bid)
+        if mode == "BUY":
+            return f"{i}. {row['ex']}: Bs {row['ask']:,.2f}"
+        else:
+            return f"{i}. {row['ex']}: Bs {row['bid']:,.2f}"
+
+    lines = ["💵 USDT en BOB (volumen ref: {} USDT)".format(VOLUME)]
+    if best_buy:
+        lines.append("🔽 Mejores para *comprar* (menor ask):")
+        for i, r in enumerate(best_buy, 1):
+            lines.append(line(i, r, "BUY"))
+    else:
+        lines.append("🔽 Mejores para *comprar*: sin datos")
+
+    if best_sell:
+        lines.append("\n🔼 Mejores para *vender* (mayor bid):")
+        for i, r in enumerate(best_sell, 1):
+            lines.append(line(i, r, "SELL"))
+    else:
+        lines.append("\n🔼 Mejores para *vender*: sin datos")
+
+    lines.append(f"\n⏱️ {ts_local_str}")
+    return "\n".join(lines)
+
 @app.get("/")
 async def root():
     return {"ok": True, "time": int(time.time())}
 
-# 2) Webhook de Telegram (se despierta gratis cuando alguien escribe al bot)
+# Webhook de Telegram
 @app.post(f"/{SECRET_PATH}")
 async def telegram_webhook(req: Request):
     update = await req.json()
-    # Si envías /start, responde y, si quieres, guarda el chat_id de quien habló.
     message = update.get("message") or update.get("edited_message") or {}
     text = (message.get("text") or "").strip().lower()
-    from_chat = message.get("chat", {}).get("id")
+    chat = message.get("chat", {}).get("id")
+
     if text == "/start":
-        await send_msg("Listo ✅ Te enviaré el precio cada 30 minutos. Usa /precio para ver ahora mismo.", from_chat)
+        await send_msg("Listo ✅ Usa /precio para ver los top 2 de compra y venta por exchange.", chat)
     elif text == "/precio":
-        ask, bid, ts = await fetch_price()
-        bolivia = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
-        await send_msg(
-            f"💵 USDT en BOB\n• Compra (ask): Bs {ask:,.2f}\n• Venta (bid): Bs {bid:,.2f}\n⏱️ {bolivia} (hora local)",
-            from_chat
-        )
+        try:
+            best_buy, best_sell, ts = await fetch_top2()
+            ts_local = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+            await send_msg(format_top2(best_buy, best_sell, ts_local), chat)
+        except Exception as e:
+            await send_msg(f"⚠️ No pude obtener precios ahora: {e}", chat)
     return {"ok": True}
 
-# 3) Endpoint que llamará cron-job.org cada 30 min
+# Endpoint para cron cada 30 min
 @app.get("/send")
 async def tick(key: str):
     if key != CRON_KEY:
         raise HTTPException(status_code=401, detail="bad key")
-    ask, bid, ts = await fetch_price()
-    local = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
-    await send_msg(
-        f"💵 USDT en BOB\n• Compra (ask): Bs {ask:,.2f}\n• Venta (bid): Bs {bid:,.2f}\n⏱️ {local}",
-        CHAT_ID
-    )
+    best_buy, best_sell, ts = await fetch_top2()
+    ts_local = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    await send_msg(format_top2(best_buy, best_sell, ts_local), CHAT_ID)
     return {"sent": True}
+
+
